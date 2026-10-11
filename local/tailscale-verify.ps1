@@ -5,12 +5,19 @@ $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
 if (-not (Test-Path $ts)) { Write-Output 'NO tailscale.exe'; exit 1 }
 
 Write-Output '===== 1. login and backend state ====='
+# NOTE: in `tailscale status --json`, Self and Peer are dictionaries keyed by node ID,
+# NOT plain objects. Take .PSObject.Properties.Value to get the node itself.
 $j = & $ts status --json 2>$null | ConvertFrom-Json
+$selfNode = @($j.Self.PSObject.Properties.Value)[0]
+$peerNodes = @($j.Peer.PSObject.Properties.Value)
+
 Write-Output ('  BackendState : ' + $j.BackendState)
-Write-Output ('  self         : ' + $j.Self.Hostname + '  ' + $j.Self.Addresses[0])
-Write-Output ('  tailnet user : ' + $j.UserLoginName)
-Write-Output ('  peers        : ' + (@($j.Peer).Count) + '   (2 once the Actions runner joins)')
-Write-Output ('  MagicDNS     : ' + $j.MagicDNSEnabled + '   (we skipped their DNS on purpose; use raw IPs)')
+Write-Output ('  self         : ' + $selfNode.HostName + '  ' + (@($selfNode.Addresses) | Where-Object { "$_" -match '^100\.' } | Select-Object -First 1))
+Write-Output ('  tailnet      : ' + $j.MagicDNSSuffix)
+Write-Output ('  peers        : ' + $peerNodes.Count + '   (1 once the Actions runner joins)')
+foreach ($p in $peerNodes) {
+    Write-Output ('    - ' + $p.HostName + ' ' + (@($p.Addresses) | Where-Object { "$_" -match '^100\.' } | Select-Object -First 1) + ' online=' + $p.Online)
+}
 
 Write-Output '===== 2. tailscale interface IP ====='
 Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |

@@ -89,14 +89,22 @@ Start-Sleep -Seconds 6
 $status = Protect (& $ts status --json 2>&1)
 
 $ip = $null; $dns = $null
+# 实测坑（run 38109763519 的教训）：`tailscale status --json` 里 Self 跟 Peer 一样，
+# 是「以节点 ID 为键」的一层字典，不是直接的对象。所以 $j.Self.Addresses 取不到东西，
+# 必须先把那唯一的值取出来。
 try {
   $j = $status | ConvertFrom-Json
-  $ip = ($j.Self.Addresses | Where-Object { $_ -match '^100\.' } | Select-Object -First 1)
-  $dns = $j.Self.DNSName
-} catch { Write-Host "  状态解析失败（不影响，看下面原始输出）" }
+  $selfNode = @($j.Self.PSObject.Properties.Value)[0]
+  if ($selfNode) {
+    $ip = (@($selfNode.Addresses) | Where-Object { "$_" -match '^100\.' } | Select-Object -First 1)
+    $dns = $selfNode.DNSName
+  }
+} catch { Write-Host "  状态解析失败（不影响，走下面的 ip 兜底）" }
 
 if (-not $ip) {
-  $lines = Protect (& $ts ips 2>&1)
+  # 兜底用子命令 `tailscale ip -4`。注意：没有 `tailscale ips` 这个东西，
+  # 上一次就是写错成 ips，白失败一次，而且它的非零退出码还会被 pwsh 当成脚本退出码。
+  $lines = Protect (& $ts ip -4 2>&1)
   if ($lines -match '(100\.\d+\.\d+\.\d+)') { $ip = $Matches[1] }
 }
 
@@ -110,10 +118,32 @@ Write-Host "  用户名          : $env:RDP_USER"
 Write-Host "  （口令就是你在 Secrets 里设的那串，这里不显示、不进日志）"
 Write-Host ""
 if ($ip) {
-  Write-Host "  本地怎么连：开始菜单搜 mstsc → 计算机填 $ip → 用户名 $env:RDP_USER"
-  Write-Host "  手机同理：装 Tailscale App 登同一个账号，再用 Remote Desktop 类 App 连同一个地址"
+  Write-Host ""
+  Write-Host "  ★ 本地怎么连：开始菜单搜 mstsc → 计算机填 $ip → 用户名 $env:RDP_USER"
+  Write-Host "    （用裸 IP，别用 .ts.net 域名：你本机 Clash 是 fake-ip，域名会被换成假地址）"
+  Write-Host "  ★ 手机同理：装 Tailscale App 登同一个账号，用 Remote Desktop 类 App 连同一个 IP"
 } else {
-  Write-Host "::warning::没拿到 100.x 地址。多半是 key 不对、key 是一次性的且已用掉、或者 ACL 拦了。原始状态："
+  Write-Host "::warning::还是没拿到 100.x 地址。可能 key 失效、被 ACL 拦、或这个号设备数到顶了。原始状态："
   Write-Host $status
 }
+
+# 顺手把「看得见哪些设备」打出来：能看到 home-pc 就证明这台 runner 真的在你私有网里，
+# 而不是只是注册上了却不通。
+try {
+  $peers = @($j.Peer.PSObject.Properties.Value)
+  if ($peers.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  在这台 runner 上能看到的同网设备："
+    foreach ($p in $peers) {
+      Write-Host ("    {0,-16} {1,-15} online={2}" -f $p.HostName, (@($p.Addresses | Where-Object { "$_" -match '^100\.' } | Select-Object -First 1)), $p.Online)
+    }
+  } else {
+    Write-Host "  （同网暂时没别的设备 —— 确认你本机 Tailscale 是连着的）"
+  }
+} catch { Write-Host "  对端列表解析失败，不影响使用" }
+
 Write-Host "===================================================="
+
+# 必须显式 exit 0：`pwsh -File` 会把最后一条原生命令的退出码当成脚本的退出码，
+# 上面任何一次 tailscale 子调用返回非 0，都会让这一步被误判成失败（上次就是这么假报警的）。
+exit 0
