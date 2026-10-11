@@ -1,0 +1,134 @@
+name: 简易代理（零注册、零 Secrets）
+
+# 这个工作流干的事：在 GitHub 的一次性 Linux 机器上起一个 VLESS 代理，
+# 用 Cloudflare 的快速隧道把它接出来，最后把能直接粘贴的节点地址打在日志里。
+#
+# 为什么要绕 Cloudflare 一下：runner 没有公网 IP，外面连不进去，这是 GitHub 的架构，
+# 不管用什么办法都省不掉这一层。
+#
+# 只有手动触发这一种。不加 push / pull_request / schedule / 自循环保活 ——
+# 前者是公开仓泄密的头号路子，后者正好是条款里「用自动化手段给服务器造成不当负担」那条。
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "这个节点活多少分钟（平台硬顶单 job 6 小时 = 360 分钟）"
+        required: false
+        default: "120"
+        type: choice
+        options:
+          - "30"
+          - "120"
+          - "350"
+
+# 同时只准跑一个，手滑点两次不会变成两台机器
+concurrency:
+  group: proxy-one-at-a-time
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 下载 xray 和 cloudflared
+        run: |
+          set -e
+          cd "$RUNNER_TEMP"
+          # xray：负责把 VLESS 代理跑起来
+          curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q -o xray.zip
+          chmod +x xray
+          # cloudflared：负责把这台机器接到外面去，快速隧道不用注册账号
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          echo "xray: $(./xray version | head -1)"
+          echo "cloudflared: $(./cloudflared --version)"
+
+      - name: 起代理并接出隧道，把地址打在日志里
+        run: |
+          set -e
+          cd "$RUNNER_TEMP"
+
+          # 每次跑都新生成一个 UUID 和一个随机路径。
+          # 这俩就是你节点的「口令」，不落盘、不复用，机器一销毁就作废。
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          PATHX=$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+
+          # 用 clients 数组 + decryption:none 这个现代写法。
+          # 老的 settings.id 单用户写法在新版 xray 上已经被弃用，少了 decryption 还会启动失败。
+          cat > config.json <<EOF
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": 7890,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [ { "id": "$UUID" } ],
+                  "decryption": "none"
+                },
+                "streamSettings": { "network": "ws", "wsSettings": { "path": "/$PATHX" } }
+              }
+            ]
+          }
+          EOF
+
+          ./xray -c config.json >xray.log 2>&1 &
+          sleep 3
+          if ! pgrep -x xray >/dev/null; then
+            echo "::error::xray 没起来，它的日志："; cat xray.log; exit 1
+          fi
+          echo "xray 已在 127.0.0.1:7890 起来"
+
+          # 快速隧道：--url 指向本地代理端口，不给域名、不登录，它自己吐一个 https 地址
+          ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:7890 >cf.log 2>&1 &
+          CFPID=$!
+
+          # 等它把 trycloudflare 域名吐出来，最多等 60 秒
+          # 注意那个 `|| true`：上面开了 set -e，而 grep 没匹配到时返回非 0，
+          # 不加就会在第一次还没出地址的时候整个 job 直接退出，等不到重试。
+          HOST=""
+          for i in $(seq 1 30); do
+            HOST=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' cf.log | head -1 | sed 's#https://##' || true)
+            [ -n "$HOST" ] && break
+            sleep 2
+          done
+          if [ -z "$HOST" ]; then
+            echo "::error::60 秒没等到隧道地址。cloudflared 日志："; cat cf.log; exit 1
+          fi
+
+          LINK="vless://$UUID@$HOST:443?encryption=none&security=tls&type=ws&path=%2F$PATHX&sni=$HOST#Actions临时代理"
+
+          echo ""
+          echo "=================== 拿这个去用 ==================="
+          echo "节点地址（Clash Verge / v2rayN / NekoBox 可直接粘贴导入）："
+          echo ""
+          echo "$LINK"
+          echo ""
+          echo "手动填参数的话："
+          echo "  协议     VLESS"
+          echo "  地址     $HOST"
+          echo "  端口     443"
+          echo "  UUID     $UUID"
+          echo "  传输     ws        路径 /$PATHX     TLS 开（SNI 同地址）"
+          echo "==================================================="
+          echo ""
+          echo "提醒：这段日志在公开仓里全世界能看，所以这个节点是「谁看到谁就能用」，"
+          echo "     活不过本次会话结束。别拿它传任何要紧的东西。"
+
+      - name: 保持节点在线
+        env:
+          # 走 env 而不是直接把 ${{ }} 拼进脚本，避免表达式里万一出现引号把 bash 撑破
+          KEEP_MINUTES: ${{ github.event.inputs.minutes || '120' }}
+        run: |
+          M="$KEEP_MINUTES"
+          case "$M" in ''|*[!0-9]*) echo "时长不是纯数字（$M），退回 120 分钟"; M=120 ;; esac
+          echo "节点将保留 $M 分钟。想提前收工就在 Actions 页面点 Cancel workflow。"
+          # 就挂着不动：job 一结束机器销毁、隧道断开、节点自然作废
+          sleep $((M * 60))

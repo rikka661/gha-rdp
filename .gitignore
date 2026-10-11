@@ -1,0 +1,4 @@
+# 本地临时东西，别推到 GitHub 上去
+_research/
+*.log
+*.tmp

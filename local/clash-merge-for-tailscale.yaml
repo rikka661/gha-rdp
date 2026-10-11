@@ -1,0 +1,28 @@
+# 【可选，现在不用动】Clash Verge 扩展配置（Merge），用来让 .ts.net 域名能解析
+#
+# 你的现状（实测查出来的）：
+#   - tun 开着（device=Mihomo, stack=gvisor, strict-route=false）
+#   - 规则里已经有 IP-CIDR,100.64.0.0/10,DIRECT  ← 所以走裸 IP 连 Tailscale 完全没问题
+#   - dns 是 fake-ip 模式，而且没有 fake-ip-filter  ← 这是唯一会出问题的地方
+#
+# 后果只有一条：用 xxx.your-tailnet.ts.net 这种域名连会失败
+# （fake-ip 会先把它变成一个 198.18.x.x 的假地址，然后被当成普通境外域名丢给节点，节点当然连不到你的私有网）。
+# 用 100.x 的裸 IP 连则一点事没有 —— 我给的那套工作流打印的就是裸 IP，所以默认路径不受影响。
+#
+# 真的想用域名的话：Clash Verge → 订阅页 → 给你在用的配置加一份「扩展配置 / Merge」，
+# 把下面这几行进去，保存后重连一次。出问题就把这份 merge 删掉，你的原配置一个字没被改。
+
+prepend-rules:
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,ts.net,DIRECT
+  - DOMAIN-SUFFIX,tailscale.com,DIRECT
+
+dns:
+  # 让这些域名不走 fake-ip，交给真实 DNS 回答
+  fake-ip-filter:
+    - '+.ts.net'
+    - '+*.ts.net'
+    - '+.tailscale.com'
+  # 私有网里的名字交给 Tailscale 自己的 DNS（它固定监听 100.100.100.100）
+  nameserver-policy:
+    '+.ts.net': '100.100.100.100'

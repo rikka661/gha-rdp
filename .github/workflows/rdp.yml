@@ -1,0 +1,84 @@
+name: RDP 临时远程桌面
+
+# 只做手动触发。绝对不加 push / pull_request / schedule / 自循环。
+#   - 不加 pull_request：fork 上来的 PR 拿不到 Secrets，这是公开仓最常见的泄密路子
+#   - 不加 schedule/自循环保活：那正是「给服务器造成不当负担」的特征，会撞 AUP §9
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_user:
+        description: "RDP 登录用户名（只用字母数字）"
+        required: false
+        default: "aideck"
+        type: string
+      device_name:
+        description: "Tailscale 里的设备名（小写字母和连字符）"
+        required: false
+        default: "gha-rdp"
+        type: string
+      duration_minutes:
+        description: "这次会话留多少分钟（到点自动收工）"
+        required: false
+        default: "55"
+        type: choice
+        options:
+          - "25"
+          - "55"
+          - "120"
+          - "350"
+
+# 同一时间只准跑一个会话。
+# 手滑点两次不会变成「两台机器同时挂着」——那正好是社区实测会被标记的行为。
+concurrency:
+  group: rdp-one-session-at-a-time
+  cancel-in-progress: false
+
+# 公开仓只要读权限就够。不给 write，泄露面就小一圈。
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    # 平台侧硬顶就是 6 小时（官方 limits 页：All GitHub-hosted runners / Job execution time 6 hours），
+    # 写 9999 也拦不住截断，所以这里写满 360，实际时长由上面的 duration_minutes 控制。
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      RDP_USER: ${{ github.event.inputs.rdp_user || 'aideck' }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      TS_HOSTNAME: ${{ github.event.inputs.device_name || 'gha-rdp' }}
+      SESSION_MINUTES: ${{ github.event.inputs.duration_minutes || '55' }}
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      # 只检查「有没有」，任何一行都不许把值本身打到日志里。
+      # 参考项目里那种「把口令 base64 编码后打印、绕过 GitHub 的 *** 遮罩」的写法，
+      # 在公开仓等于把口令贴给全世界看，这里明确不照抄。
+      - name: 检查 Secrets 是否就位
+        shell: pwsh
+        run: ./scripts/check-secrets.ps1
+
+      - name: 开远程桌面（建账号 + 放行 3389）
+        shell: pwsh
+        run: ./scripts/enable-rdp.ps1
+
+      - name: 接入 Tailscale 私有网
+        shell: pwsh
+        run: ./scripts/join-tailscale.ps1
+
+      # 这一步之后机器就可达了，控制台会给出 mstsc 该填的地址。
+      # 口令不在这儿，是你自己在 Secrets 里设的那串。
+      - name: 保持会话（到点自动退出，也可在网页上点 Cancel 提前收工）
+        shell: pwsh
+        run: ./scripts/wait-session.ps1
+
+      # 不管前面成功还是失败都要跑：退网 + 把这台设备从 tailnet 里删掉，
+      # 免得每次 CI 跑完都在你的设备列表里堆一个僵尸节点。
+      - name: 收尾退出 Tailscale
+        if: always()
+        shell: pwsh
+        run: ./scripts/leave-tailscale.ps1
