@@ -37,30 +37,41 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
 TLS='{"certificates":[{"certificateFile":"cert.pem","keyFile":"key.pem"}]}'
 WS_SS="{\"network\":\"ws\",\"wsSettings\":{\"path\":\"/$PATHX\"}}"
 
-# 逐个试：$1 = 这个直连入口的 streamSettings；传空字符串表示不要直连口
-try_start() {
-  pkill -x xray >/dev/null 2>&1 || true
-  sleep 1
+# 探测一份配置能不能跑：$1 = 直连入口的 streamSettings（空 = 只留 ws 一个入口）
+#
+# 判定只用 xray 自己的退出码，不去 grep 日志 —— 上一版就是栽在这儿：
+# xray 的告警行长这样「[Warning] common/errors: The feature WebSocket transport ... deprecated」,
+# 日志包名 common/errors 里含 "error" 子串，于是三份全都正常的配置被我一律判成失败，
+# 而紧接着那行 [Warning] core: Xray started 才反映真实结果。别再用子串猜成败。
+probe_config() {
   rm -f config.json xray.log
   if ! bash "$RENDER" "$1" "$UUID" "$WS_SS" > config.json; then
-    echo "::error::配置渲染失败（$RENDER）"
+    echo "  · 配置渲染失败（$RENDER）"
     return 1
   fi
-  # 落盘前先确认渲染出来的真的是合法 JSON —— 语法错的配置 xray 只会静默起不来
-  if ! python3 -c 'import json,sys; json.load(open("config.json"))' >/dev/null 2>&1; then
-    echo "::error::渲染结果不是合法 JSON，内容："
-    cat config.json
+  if ! python3 -c 'import json;json.load(open("config.json"))' >/dev/null 2>&1; then
+    echo "  · 渲染结果不是合法 JSON："
+    head -c 300 config.json | sed 's/^/      /'
     return 1
   fi
-  nohup ./xray -c config.json > xray.log 2>&1 &
-  sleep 3
-  if pgrep -x xray >/dev/null; then
-    if grep -qiE 'error|failed|invalid|unknown' xray.log; then
-      return 1
-    fi
+  # timeout 到点杀进程返回 124 —— 撑满 5 秒说明 xray 正常跑着；其他退出码才是真失败
+  timeout 5 ./xray run -c config.json > xray.log 2>&1
+  rc=$?
+  if [ $rc -eq 124 ]; then
     return 0
   fi
+  echo "  · xray 拒绝这份配置（退出码 $rc），关键日志行："
+  grep -a -E 'Failed|error:|invalid|unknown|bind|permission|not found' xray.log | head -3 | sed 's/^/      /'
+  [ -s xray.log ] || echo "      （日志为空）"
   return 1
+}
+
+# 选定后正式常驻启动，并用 PID 而不是进程名来判断它还活着
+start_final() {
+  nohup ./xray run -c config.json > xray.log 2>&1 &
+  XRAY_PID=$!
+  sleep 2
+  kill -0 "$XRAY_PID" 2>/dev/null
 }
 
 echo "== 3. 挑一个能起来的 xray 配置 =="
@@ -71,19 +82,23 @@ for cand in \
   "{\"network\":\"http\",\"security\":\"tls\",\"tlsSettings\":$TLS,\"httpSettings\":{\"path\":\"/$PATHX\",\"host\":\"$DEV\"}}|http(hy2 旧名)" \
   "|不开直连口，只用 ws"; do
   ss="${cand%%|*}"; label="${cand##*|}"
-  if try_start "$ss"; then
-    DIRECT_LABEL="$label"
-    case "$label" in
-      xhttp*) DIRECT_NET="h2" ;;
-      http*)  DIRECT_NET="h2" ;;
-      *)      DIRECT_NET="" ;;
-    esac
-    echo "  ✔ 采用：$label"
-    break
+  if probe_config "$ss"; then
+    if start_final; then
+      DIRECT_LABEL="$label"
+      case "$label" in
+        xhttp*) DIRECT_NET="h2" ;;
+        http*)  DIRECT_NET="h2" ;;
+        *)      DIRECT_NET="" ;;
+      esac
+      echo "  ✔ 采用：$label（xray pid=$XRAY_PID）"
+      break
+    fi
+    echo "  ✘ 探测通过但常驻启动失败：$label"
+  else
+    echo "  ✘ 不行：$label"
   fi
-  echo "  ✘ 不行：$label"
 done
-[ -z "$DIRECT_LABEL" ] && { echo "::error::xray 三种配置都起不来，日志："; cat xray.log; exit 1; }
+[ -z "$DIRECT_LABEL" ] && { echo "::error::xray 三种配置都没能用上，最后一次的日志："; cat xray.log; exit 1; }
 echo "  xray 在跑：ws 口 = 127.0.0.1:7890（服务备用隧道）；直连口 = ${DIRECT_LABEL}"
 
 echo "== 4. 接 Tailscale 私有网 =="
