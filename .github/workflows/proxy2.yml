@@ -1,0 +1,62 @@
+name: 代理节点 v2（Tailscale 直连 + hy2）
+
+# 相比 proxy.yml 的三处改动，都对着实测结果：
+#   1. 主路改成 Tailscale 直连。快速隧道每次给你随机 trycloudflare 域名，
+#      完整节点链接还落在公开仓日志里；走私有网就没这两个毛病，而且少一层中转。
+#   2. xray 开两个入口：8443 上是 hy2（TLS，走 Tailscale），7890 上是 ws（备用，走快速隧道）。
+#   3. 日志里直接打出口 IP 的归属（ipinfo），过盾为什么失败这件事不用再靠猜。
+#
+# 依然只有手动触发，不加 push / pull_request / schedule / 自循环保活 ——
+# 前者是公开仓泄密头号文件，后者正好命中条款里「用自动化手段给服务器造成不当负担」。
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "节点活多少分钟（平台硬顶单 job 6 小时）"
+        required: false
+        default: "55"
+        type: choice
+        options:
+          - "25"
+          - "55"
+          - "120"
+          - "350"
+      device_name:
+        description: "Tailscale 里的设备名（小写字母和连字符）"
+        required: false
+        default: "gha-proxy"
+        type: string
+      show_cf_link:
+        description: "要不要在日志里显示备用隧道的完整链接（默认不显示）"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+
+# 单独一个并发组，跟 proxy.yml 那条互不阻塞
+concurrency:
+  group: proxy2-one-at-a-time
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      TS_HOSTNAME: ${{ github.event.inputs.device_name || 'gha-proxy' }}
+      SESSION_MINUTES: ${{ github.event.inputs.minutes || '55' }}
+      SHOW_CF_LINK: ${{ github.event.inputs.show_cf_link || '0' }}
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 起节点（xray 双入口 + Tailscale + 备用隧道）
+        run: bash scripts/proxy2-node.sh
