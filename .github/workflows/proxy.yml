@@ -59,6 +59,9 @@ jobs:
           UUID=$(cat /proc/sys/kernel/random/uuid)
           PATHX=$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
 
+          # 必须同时写 inbounds 和 outbounds：只写 inbounds 的话，xray 能起来、
+          # WebSocket 也能握手成功（我实测 101 Switching Protocols），但流量进来之后
+          # 没有出口，于是既不报错也不返回数据 —— 客户端看到的就是「连上了但没网络」。
           # 用 clients 数组 + decryption:none 这个现代写法。
           # 老的 settings.id 单用户写法在新版 xray 上已经被弃用，少了 decryption 还会启动失败。
           cat > config.json <<EOF
@@ -74,6 +77,12 @@ jobs:
                   "decryption": "none"
                 },
                 "streamSettings": { "network": "ws", "wsSettings": { "path": "/$PATHX" } }
+              }
+            ],
+            "outbounds": [
+              {
+                "protocol": "freedom",
+                "settings": {}
               }
             ]
           }
